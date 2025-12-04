@@ -1,84 +1,23 @@
 [
+  { "name": "set_tree_node", "args": [0, 7, 500, 1, 2, 0, 0] },
+  { "name": "set_tree_node", "args": [1, 0, 0, 0, 0, 1, 0] },
+  { "name": "set_tree_node", "args": [2, 0, 0, 0, 0, 1, 1] },
   {
-    "name": "set_tree_node",
+    "name": "pkt_in",
     "args": [
-      0,
-      7,
-      500,
-      1,
-      2,
-      0,
-      0
-    ]
-  },
-  {
-    "name": "set_tree_node",
-    "args": [
-      1,
-      0,
-      0,
-      0,
-      0,
-      1,
-      0
-    ]
-  },
-  {
-    "name": "set_tree_node",
-    "args": [
-      2,
-      0,
-      0,
-      0,
-      0,
-      1,
-      1
+      0, 0, 2048,           
+      100, 200, 6, 100, 64, 
+      1234, 80, 0,          
+      1                     
     ]
   },
   {
     "name": "pkt_in",
     "args": [
-      {
-        "dmac": 0,
-        "smac": 0,
-        "etype": 2048
-      },
-      {
-        "src": 100,
-        "dst": 200,
-        "proto": 6,
-        "len": 100,
-        "ttl": 64
-      },
-      {
-        "sport": 1234,
-        "dport": 80,
-        "flags": 0
-      },
-      1
-    ]
-  },
-  {
-    "name": "pkt_in",
-    "args": [
-      {
-        "dmac": 0,
-        "smac": 0,
-        "etype": 2048
-      },
-      {
-        "src": 100,
-        "dst": 200,
-        "proto": 6,
-        "len": 1000,
-        "ttl": 64
-      },
-      {
-        "sport": 1234,
-        "dport": 80,
-        "flags": 0
-      },
-      1
+      0, 0, 2048,           
+      100, 200, 6, 1000, 64, 
+      1234, 80, 0,          
+      1                     
     ]
   }
 ]
