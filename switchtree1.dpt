@@ -1,0 +1,332 @@
+// ---- CONSTANTS ----
+const int<32> HASH_SIZE = 8192;
+const int<32> HASH_MASK = 8191; 
+const int<32> TREE_SIZE = 1024; 
+const int<32> FLOW_TIMEOUT_NS = 15000000000; 
+
+// Structs
+type eth_h = { int<48> dmac; int<48> smac; int<16> etype; }
+type ip_h  = { int<32> src; int<32> dst; int<8> proto; int<16> len; int<8> ttl; }
+type tcp_h = { int<16> sport; int<16> dport; int<8> flags; }
+
+// ---- EVENTS ----
+event pkt_in(
+    int<48> eth_dmac, int<48> eth_smac, int<16> eth_type, 
+    int<32> ip_src, int<32> ip_dst, int<8> ip_proto, int<16> ip_len, int<8> ip_ttl,
+    int<16> tcp_sport, int<16> tcp_dport, int<8> tcp_flags,
+    int<32> ingress_port
+);
+
+event calc_features(
+    int<32> idx, 
+    int<32> do_reset_int, 
+    int<16> ip_len, 
+    int<8> ip_ttl, 
+    int<8> tcp_flags,
+    int<32> ip_src, 
+    int<32> ingress_port
+);
+
+event check_node(
+    int<32> node_id,
+    int<32> ip_src,
+    int<32> ingress_port,
+    int<8> f_sttl,
+    int<8> f_dttl,
+    int<32> f_rtt,
+    int<64> f_sbytes,
+    int<64> f_sload_num,
+    int<64> f_duration
+);
+
+event set_tree_node(
+    int<32> node_id, 
+    int<8> f_id, 
+    int<64> threshold, 
+    int<32> true_node, 
+    int<32> false_node, 
+    int<1> is_leaf, 
+    int<1> class_val
+);
+
+event forward(int<32> port);
+event detected_attack(int<32> src_ip, int<64> sbytes);
+
+// ---- GLOBAL STATE ----
+// Unified Tree Memory (64-bit)
+global Array.t<64> tree_memory = Array.create(TREE_SIZE); 
+
+// Flow State
+global Array.t<32> reg_srcip   = Array.create(HASH_SIZE);
+global Array.t<64> reg_time_last  = Array.create(HASH_SIZE);
+
+global Array.t<32> reg_sbytes  = Array.create(HASH_SIZE);
+global Array.t<32> reg_spkts   = Array.create(HASH_SIZE);
+global Array.t<32> reg_dttl    = Array.create(HASH_SIZE); 
+global Array.t<64> reg_time_first = Array.create(HASH_SIZE);
+global Array.t<64> reg_syn_time   = Array.create(HASH_SIZE);
+global Array.t<32> reg_tcprtt     = Array.create(HASH_SIZE);
+
+// ---- MEMOPS ----
+memop check_claim(int<32> mem, int<32> new_val) {
+    if (mem == 0) { return new_val; }
+    else { return mem; }
+}
+memop add_memop(int<32> mem, int<32> val) { return mem + val; }
+memop incr_memop(int<32> mem, int<32> ignored) { return mem + 1; }
+memop return_mem_64(int<64> mem, int<64> ignored) { return mem; }
+memop set_zero_64(int<64> mem, int<64> ignored) { return 0; }
+
+memop update_flagged_32(int<32> mem, int<32> arg) {
+    if (arg == 0) { return mem; }
+    else { return arg - 1w32; }
+}
+memop update_flagged_64(int<64> mem, int<64> arg) {
+    if (arg == 0w64) { return mem; }
+    else { return arg - 1w64; }
+}
+
+// ---- HELPER ----
+fun int<64> mult(int<64> a, int<64> b) {
+    int<64> res = 0w64;
+    int<64> ta = a;
+    int<64> tb = b;
+    for (i < 64) {
+        // Use 1w64 instead of casting
+        if ((tb & 1w64) == 1w64) {
+            res = res + ta;
+        }
+        ta = ta << 1;
+        tb = tb >> 1;
+    }
+    return res;
+}
+// ---- HANDLER 1: INGRESS ----
+handle pkt_in(
+    int<48> eth_dmac, int<48> eth_smac, int<16> eth_type, 
+    int<32> ip_src, int<32> ip_dst, int<8> ip_proto, int<16> ip_len, int<8> ip_ttl,
+    int<16> tcp_sport, int<16> tcp_dport, int<8> tcp_flags,
+    int<32> ingress_port
+) {
+  int<64> now = (int<64>)Sys.time();
+  int<32> idx = hash<32>(ip_src, ip_dst, tcp_sport, tcp_dport, ip_proto) & HASH_MASK;
+
+  int<32> stored_ip = Array.update(reg_srcip, idx, check_claim, ip_src, check_claim, ip_src);
+  bool collision = (stored_ip != 0 && stored_ip != ip_src);
+  bool new_flow = (stored_ip == 0);
+
+  if (!collision) {
+      int<32> reset_int = 0;
+      if (new_flow) { reset_int = 1; }
+      Array.set(reg_time_last, idx, now);
+      generate calc_features(idx, reset_int, ip_len, ip_ttl, tcp_flags, ip_src, ingress_port);
+  }
+}
+
+// ---- HANDLER 2: STATS ----
+handle calc_features(
+    int<32> idx, 
+    int<32> do_reset_int, 
+    int<16> ip_len, 
+    int<8> ip_ttl, 
+    int<8> tcp_flags,
+    int<32> ip_src, 
+    int<32> ingress_port
+) {
+    int<64> now = (int<64>)Sys.time();
+    int<32> sbytes_32 = 0;
+    int<32> spkts_32 = 0;
+    int<64> sbytes = 0;
+    int<64> spkts = 0;
+    int<64> start_time = 0;
+    int<64> duration = 0;
+    int<32> rtt_val = 0;
+    int<64> stored_syn = 0;
+    int<32> sample = 0;
+    
+    bool is_syn = false;
+    bool is_ack = false;
+    int<64> syn_arg = 0;
+    int<32> rtt_arg = 0;
+    int<64> pkts_minus_one = 0;
+    int<64> base_calc = 0;
+    int<64> sload_numerator = 0;
+
+    if (do_reset_int == 1) {
+        Array.set(reg_sbytes, idx, (int<32>)ip_len);
+        Array.set(reg_spkts, idx, 1);
+        sbytes_32 = (int<32>)ip_len;
+        spkts_32 = 1;
+    } else {
+        sbytes_32 = Array.update(reg_sbytes, idx, add_memop, (int<32>)ip_len, add_memop, (int<32>)ip_len);
+        spkts_32  = Array.update(reg_spkts, idx, incr_memop, 0, incr_memop, 0);
+    }
+    sbytes = (int<64>)sbytes_32;
+    spkts  = (int<64>)spkts_32;
+
+    if (do_reset_int == 1) {
+        Array.set(reg_time_first, idx, now);
+        start_time = now;
+    } else {
+        start_time = Array.get(reg_time_first, idx);
+    }
+    duration = now - start_time;
+    if (duration == 0w64) { duration = 1w64; }
+
+    is_syn = ((tcp_flags & 16w8) == 0w8 && (tcp_flags & 2w8) == 2w8);
+    is_ack = ((tcp_flags & 16w8) == 16w8 && (tcp_flags & 2w8) == 0w8);
+
+    if (do_reset_int == 1) {
+        syn_arg = 1w64; // Corrected to 64-bit
+    } else {
+        if (is_syn) { syn_arg = now + 1w64; } // Corrected to 64-bit
+        else {
+            if (is_ack) { syn_arg = 1w64; } 
+            else { syn_arg = 0w64; } 
+        }
+    }  
+    stored_syn = Array.update(reg_syn_time, idx, return_mem_64, 0w64, update_flagged_64, syn_arg);
+    if (is_ack) {
+        if (stored_syn > 0w64) { // Fix: 0 -> 0w64
+            sample = (int<32>)(now - stored_syn);
+        }
+    }
+
+    if (do_reset_int == 1) {
+        rtt_arg = 1; // This is fine (int<32>)
+    } else {
+        if (sample > 0) { rtt_arg = sample + 1; }
+        else { rtt_arg = 0; } 
+    }
+
+    rtt_val = Array.update(reg_tcprtt, idx, update_flagged_32, rtt_arg, update_flagged_32, rtt_arg);
+
+    pkts_minus_one = spkts - 1w64;
+    base_calc = mult(sbytes, pkts_minus_one);
+    sload_numerator = base_calc << 3; 
+
+    generate check_node(0, ip_src, ingress_port, (int<8>)ip_ttl, 64w8, rtt_val, sbytes, sload_numerator, duration);
+}
+
+// ---- HANDLER 3: CHECK NODE ----
+handle check_node(
+    int<32> node_id,
+    int<32> ip_src,
+    int<32> ingress_port,
+    int<8> f_sttl,
+    int<8> f_dttl,
+    int<32> f_rtt,
+    int<64> f_sbytes,
+    int<64> f_sload_num,
+    int<64> f_duration
+) {
+    // READ ONCE
+    int<64> data = Array.get(tree_memory, node_id);
+
+    int<32> class_val = 0;
+    int<32> f_id = 0;
+    int<64> th = 0;
+    int<32> th_32 = 0;
+    int<8> th_8 = 0;
+    int<32> next_node = 0;
+    int<32> true_node = 0;
+    int<32> false_node = 0;
+    bool condition = false;
+    
+    int<64> million = 0;
+    int<64> lhs = 0;
+    int<64> lhs_a = 0;
+    int<64> lhs_b = 0;
+    int<64> rhs_temp = 0;
+    int<64> rhs_1_a = 0;
+    int<64> rhs_1_b = 0w64;
+    int<64> rhs = 0;
+    int<64> rhs_2_a = 0;
+    int<64> rhs_2_b = 0;
+
+    int<64> is_leaf_flag = (data >> 63) & 1w64; // Used 1w64    
+    
+    if (is_leaf_flag == 1w64) {
+        // LEAF
+        class_val = (int<32>)((data >> 32) & 0xFFFFFFw64); 
+        
+        if (class_val == 1) {
+            generate detected_attack(ip_src, f_sbytes);
+        } else {
+            generate forward(ingress_port);
+        }
+    } else {
+        // INTERNAL
+        f_id = (int<32>)((data >> 56) & 0x7Fw64);
+        th = (int<64>)((data >> 32) & 0xFFFFFFw64);
+        true_node = (int<32>)((data >> 16) & 0xFFFFw64);
+        false_node = (int<32>)(data & 0xFFFFw64);
+        
+        th_32 = (int<32>)th;
+        th_8 = (int<8>)th;
+        
+        next_node = false_node; // Default False
+        condition = false;
+
+        if ((f_id == 1) && (f_sttl <= th_8)) { condition = true; }
+        if ((f_id == 3) && (f_dttl <= th_8)) { condition = true; }
+        if ((f_id == 10) && (f_rtt <= th_32)) { condition = true; }
+        if ((f_id == 7) && (f_sbytes <= th)) { condition = true; }
+        
+        if (f_id == 4) {
+            million = 1000000w64;
+            lhs = mult(f_sload_num, million);
+            
+            rhs_temp = 0w64; // Fix: 0 -> 0w64
+            rhs_1_a = th;
+            rhs_1_b = f_duration;
+            for (l < 64) {
+                if ((rhs_1_b & 1w64) == 1w64) { // Fix: (int<64>)1 -> 1w64
+                    rhs_temp = rhs_temp + rhs_1_a; 
+                }
+                rhs_1_a = rhs_1_a << 1;
+                rhs_1_b = rhs_1_b >> 1;
+            }
+
+            rhs = 0w64; // Fix: 0 -> 0w64
+            rhs_2_a = rhs_temp;
+            rhs_2_b = f_sbytes;
+            for (m < 64) {
+                if ((rhs_2_b & 1w64) == 1w64) { // Fix: (int<64>)1 -> 1w64
+                    rhs = rhs + rhs_2_a; 
+                }
+                rhs_2_a = rhs_2_a << 1;
+                rhs_2_b = rhs_2_b >> 1;
+            }
+
+            if (lhs <= rhs) { condition = true; }
+        }
+
+        if (condition) { next_node = true_node; }
+
+        generate check_node(next_node, ip_src, ingress_port, f_sttl, f_dttl, f_rtt, f_sbytes, f_sload_num, f_duration);
+    }
+}
+
+// --- CONFIG HANDLER ---
+handle set_tree_node(int<32> node_id, int<8> f_id, int<64> threshold, int<32> true_node, int<32> false_node, int<1> is_leaf, int<1> class_val) {
+  int<64> data = 0;
+  
+  if (is_leaf == 1w1) {
+      // PACK LEAF
+      int<64> leaf_bit = 1w64 << 63;
+      int<64> cls_part = ((int<64>)class_val & 0xFFFFFFw64) << 32;
+      data = leaf_bit | cls_part;
+  } else {
+      // PACK INTERNAL
+      // Avoid masks like (int<64>)0x7F. Use 0x7Fw64 directly.
+      int<64> f_part = ((int<64>)f_id & 0x7Fw64) << 56;
+      int<64> th_part  = (threshold & 0xFFFFFFw64) << 32;
+      int<64> tr_part  = ((int<64>)true_node & 0xFFFFw64) << 16;
+      int<64> fl_part  = ((int<64>)false_node & 0xFFFFw64);
+
+    data = f_part | th_part | tr_part | fl_part;
+  }
+  
+  Array.set(tree_memory, node_id, data);
+}
