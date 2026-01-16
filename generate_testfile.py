@@ -1,63 +1,62 @@
 import json
 
-# constants ---- SAME AS LUCID CODE switchtree.dpt top
+# constants
 F_SBYTES = 7
-HASH_SIZE = 8192
 
 events = []
 
-def add_event(name, args):
-    events.append({"name": name, "args": args})
+def add_event(name, args, timestamp=0):
+    events.append({"name": name, "args": args, "timestamp": timestamp})
 
-
-# ------------------- Setup Tree ------
-    # if (sbytes <= 500) THEN (normal) else (attack)
-    # Level 0, Node 0: If (sbytes <= 500) True -> Node 1, False -> Node 2
+# ------------------- Setup Tree -------------------
+# Node 0: If (sbytes <= 500) True -> Node 1, False -> Node 2
 add_event("set_tree_node", [
     0,          # node_id
     F_SBYTES,   # feature_id (7)
     500,        # threshold
     1,          # true_node_id
     2,          # false_node_id
-    0,      # is_leaf
-    0           # class (ignored)
+    0,          # is_leaf
+    0           # class_val
 ])
 
 # Node 1: Leaf (Normal)
-add_event("set_tree_node", [
-    1, 0, 0, 0, 0, 1, 0
-])
+add_event("set_tree_node", [1, 0, 0, 0, 0, 1, 0])
 
 # Node 2: Leaf (Attack)
-add_event("set_tree_node", [
-    2, 0, 0, 0, 0, 1, 1
-])
+add_event("set_tree_node", [2, 0, 0, 0, 0, 1, 1])
 
-# -------------------  Send Traffic --------
+# -------------------  Send Traffic -------------------
 
-# Small packet (sbytes = 100) is NORMAL
-# This first packet should als oinitialize sbytes, which is stateful
+# Packet 1: Small packet (Normal)
+# FLatten arguments to match Lucid signature (12 integers)
 add_event("pkt_in", [
-    {"dmac": 0, "smac": 0, "etype": 0x0800}, # eth
-    {"src": 100, "dst": 200, "proto": 6, "len": 100, "ttl": 64}, # ip (src=100)
-    {"sport": 1234, "dport": 80, "flags": 0}, # tcp
-    1 # ingress_port
-])
-
-# Large packet from SAME flow (sbytes becomes 100 + 1000 = 1100) -> ATTACK
-add_event("pkt_in", [
-    {"dmac": 0, "smac": 0, "etype": 0x0800},
-    {"src": 100, "dst": 200, "proto": 6, "len": 1000, "ttl": 64}, 
-    {"sport": 1234, "dport": 80, "flags": 0},
+    # Ethernet Header (3 args)
+    0, 0, 0x0800,
+    # IP Header (5 args: src, dst, proto, len, ttl)
+    100, 200, 6, 100, 64,
+    # TCP Header (3 args: sport, dport, flags)
+    1234, 80, 0,
+    # Ingress Port (1 arg)
     1
 ])
 
-# Essentially: First packet (NORMAL, small # bytes). 
-# Second packet (ATTACK, large # bytes).
-# My tree should correctly classify first packet as NORMAL, second packet as ATTACK 
-# and change the flow classification
+# Packet 2: Large packet (Attack)
+add_event("pkt_in", [
+    # Ethernet
+    0, 0, 0x0800,
+    # IP (len = 1000)
+    100, 200, 6, 1000, 64,
+    # TCP
+    1234, 80, 0,
+    # Ingress
+    1
+])
+
+# Final JSON Wrapper
+final_json = {"events": events}
 
 with open("switchtree_events.json", "w") as f:
-    json.dump(events, f, indent=2)
+    json.dump(final_json, f, indent=2)
 
-print("SUCCESS: Generated switchtree_events.json")
+print("SUCCESS: Generated switchtree_events.json with flattened arguments.")
