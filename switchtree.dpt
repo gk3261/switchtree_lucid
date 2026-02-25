@@ -1,0 +1,381 @@
+// LOGIC: event-driven lucid code
+// 1. pkt_in() arrival of packet, recognize flow via hash
+// 2. calc_features() update stateful feature "memory" for that flow
+// 3. check_node() traverse thru decision tree
+// 4. forward() or detected_attack() -  Action once leaf node is hit
+
+// ---- CONSTANTS ----
+const int<32> HASH_SIZE = 8192; // # flows we can track at once
+const int<32> HASH_MASK = 8191; // BITMASK used instead of mod (for idx = hash_value % table_size)
+const int<32> TREE_SIZE = 1024; // Max # nodes of tree (Assuming 10 levels, 2^10)
+const int<32> FLOW_TIMEOUT_NS = 15000000000; 
+
+// Structs
+// TODO: LATER -- add back parts of each struct I removed for now (simplicity+testing purpose)
+type eth_t = { int<48> dmac; int<48> smac; int<16> etype; }
+type ip_t  = { int<32> src; int<32> dst; int<8> proto; int<16> len; int<8> ttl; }
+type tcp_t = { int<16> sport; int<16> dport; int<8> flags; }
+
+// ---- EVENTS ----
+// when a packet arrives --> Identify which flow
+event pkt_in(
+    int<48> eth_dmac, int<48> eth_smac, int<16> eth_type, 
+    int<32> ip_src, int<32> ip_dst, int<8> ip_proto, int<16> ip_len, int<8> ip_ttl,
+    int<16> tcp_sport, int<16> tcp_dport, int<8> tcp_flags,
+    int<32> ingress_port
+);
+
+event calc_features(
+    int<32> idx, 
+    int<32> do_reset_int, 
+    int<16> ip_len, 
+    int<8> ip_ttl, 
+    int<8> tcp_flags,
+    int<32> ip_src, 
+    int<32> ingress_port
+);
+
+event check_node(
+    int<32> node_id,
+    int<32> ip_src,
+    int<32> ingress_port,
+    int<8> f_sttl,
+    int<8> f_dttl,
+    int<32> f_rtt,
+    int<64> f_sbytes,
+    int<64> f_sload_num,
+    int<64> f_duration
+);
+
+event set_tree_node(
+    int<32> node_id, 
+    int<8> f_id, 
+    int<64> threshold, 
+    int<32> true_node, 
+    int<32> false_node, 
+    int<32> is_leaf, 
+    int<32> class_val
+);
+
+event do_forward(int<32> port);
+event do_detected_attack(int<32> src_ip, int<64> sbytes);
+
+// --- GLOBAL STATE ----
+// persistent memory between packets --> TREE memory
+  // REASON of putting both into one: Lucid only allows one atomic memory read/write op per stage
+global Array.t<64> tree_memory = Array.create(TREE_SIZE); 
+
+// Flow State
+global Array.t<32> reg_srcip   = Array.create(HASH_SIZE);
+global Array.t<64> reg_time_last  = Array.create(HASH_SIZE);
+
+global Array.t<32> reg_sbytes  = Array.create(HASH_SIZE);
+global Array.t<32> reg_spkts   = Array.create(HASH_SIZE);
+global Array.t<32> reg_dttl    = Array.create(HASH_SIZE); 
+global Array.t<64> reg_time_first = Array.create(HASH_SIZE);
+global Array.t<64> reg_syn_time   = Array.create(HASH_SIZE);
+global Array.t<32> reg_tcprtt     = Array.create(HASH_SIZE);
+
+// ---- MEMOPS ----
+// HELPERS: small atomic functions on memory unit (for read/write states)
+
+// Checks if slot in mem is free, writes Flow ID to it
+// used in pkt_in()
+memop check_claim(int<32> mem, int<32> new_val) {
+    if (mem == 0) { return new_val; }
+    else { return mem; }
+}
+
+memop add_memop(int<32> mem, int<32> val) { return mem + val; }
+memop incr_memop(int<32> mem, int<32> ignored) { return mem + 1; }
+memop return_mem_64(int<64> mem, int<64> ignored) { return mem; }
+memop set_zero_64(int<64> mem, int<64> ignored) { return 0; }
+
+// Lucid: can't read and write in the same stage
+// Solution: Use Memop to read-->
+// to KEEP old value, pass 0. to WRITE new value pass it
+// used in calc_features()
+memop update_flagged_32(int<32> mem, int<32> arg) {
+    if (arg == 0) { return mem; }
+    else { return arg - 1; }
+}
+memop update_flagged_64(int<64> mem, int<64> arg) {
+    if (arg == 0) { return mem; }
+    else { return arg - 1; }
+}
+
+
+// ---- HELPER ----
+fun int<64> mult(int<64> a, int<64> b) {
+    int<64> res = 0w64;
+    int<64> ta = a;
+    int<64> tb = b;
+    for (i < 64) {
+        // FIX: Explicitly cast tb to int<64> before masking
+        if (((int<64>)tb & 1w64) == 1w64) {
+            res = res + ta;
+        }
+        ta = ta << 1;
+        tb = tb >> 1;
+    }
+    return res;
+}
+
+// ---- HANDLER: INGRESS ----
+// hashes packet to flow idx & checks if there's a collision
+handle pkt_in(
+    int<48> eth_dmac, int<48> eth_smac, int<16> eth_type, 
+    int<32> ip_src, int<32> ip_dst, int<8> ip_proto, int<16> ip_len, int<8> ip_ttl,
+    int<16> tcp_sport, int<16> tcp_dport, int<8> tcp_flags,
+    int<32> ingress_port
+) {
+  int<64> now = (int<64>)Sys.time();
+  int<32> idx = hash<32>(ip_src, ip_dst, tcp_sport, tcp_dport, ip_proto) & HASH_MASK;
+
+  int<32> stored_ip = Array.update(reg_srcip, idx, check_claim, ip_src, check_claim, ip_src);
+  bool collision = (stored_ip != 0 && stored_ip != ip_src);
+  bool new_flow = (stored_ip == 0);
+
+  if (!collision) {
+      int<32> reset_int = 0;
+      if (new_flow) { reset_int = 1; }
+      Array.set(reg_time_last, idx, now);
+      generate calc_features(idx, reset_int, ip_len, ip_ttl, tcp_flags, ip_src, ingress_port);
+  }
+}
+
+// ---- HANDLER: STATS ----
+// handles NEW FLOW RESET & EXISTING FLOW ACCUM. (for stateful features)
+// given: idx for flow, whether hashed register should be reset
+handle calc_features(
+    int<32> idx, 
+    int<32> do_reset_int, 
+    int<16> ip_len, 
+    int<8> ip_ttl, 
+    int<8> tcp_flags,
+    int<32> ip_src, 
+    int<32> ingress_port
+) {
+    int<64> now = (int<64>)Sys.time();
+    int<32> sbytes_32 = 0;
+    int<32> spkts_32 = 0;
+    int<64> sbytes = 0;
+    int<64> spkts = 0;
+    int<64> start_time = 0;
+    int<64> duration = 0;
+    int<32> rtt_val = 0;
+    int<64> stored_syn = 0;
+    int<32> sample = 0;
+    
+    bool is_syn = false;
+    bool is_ack = false;
+    int<64> syn_arg = 0;
+    int<32> rtt_arg = 0;
+    int<64> pkts_minus_one = 0;
+    int<64> base_calc = 0;
+    int<64> sload_numerator = 0;
+
+    // WEIRD CODE-WRITING REASON: if(do_reset_int == 1){} else {}
+    // Array cannot be accessed in two different ways in the same block of code
+
+    // boolean flag-- 1 if reset, 0 if accumulate
+    // reg_sbytes: src dst byte count, reg_spkts: src dst pkt count
+    if (do_reset_int == 1) {
+        // Reset
+        Array.set(reg_sbytes, idx, (int<32>)ip_len);
+        Array.set(reg_spkts, idx, 1);
+        sbytes_32 = (int<32>)ip_len;
+        spkts_32 = 1;
+    } else {
+        // Accumulate
+        sbytes_32 = Array.update(reg_sbytes, idx, add_memop, (int<32>)ip_len, add_memop, (int<32>)ip_len);
+        spkts_32  = Array.update(reg_spkts, idx, incr_memop, 0, incr_memop, 0);
+    }
+    sbytes = (int<64>)sbytes_32;
+    spkts  = (int<64>)spkts_32;
+
+    // Duration Update. If flow reset, start_time = now. Else get start time
+    if (do_reset_int == 1) {
+        Array.set(reg_time_first, idx, now);
+        start_time = now;
+    } else {
+        start_time = Array.get(reg_time_first, idx);
+    }
+    duration = now - start_time;
+    if (duration == 0) { duration = 1; }
+
+    // TCP flags tell us flow control type packet 
+    is_syn = ((tcp_flags & 16) == 0 && (tcp_flags & 2) == 2);
+    is_ack = ((tcp_flags & 16) == 16 && (tcp_flags & 2) == 0);
+
+    // RTT/SYN logic
+    if (do_reset_int == 1) {
+        syn_arg = 1; // Write 0
+    } else {
+        // Write 0 -- CLEAR OLD SYN TIME
+        if (is_syn) { syn_arg = now + 1; }
+        else {
+            // Keep old value
+            if (is_ack) { syn_arg = 1; } // Clear
+            else { syn_arg = 0; } // Keep
+        }
+    }
+    // SIMULTANEOUSLY reads + writes to reg_syn_time (avoids Global Order Conflict) via HELPER FUNC update_flagged_64
+    stored_syn = Array.update(reg_syn_time, idx, return_mem_64, (int<64>)0, update_flagged_64, syn_arg);
+
+    // RTT Calculation and updating
+    if (is_ack) {
+        if (stored_syn > 0) {
+            sample = (int<32>)(now - stored_syn);
+        }
+    }
+
+    if (do_reset_int == 1) {
+        rtt_arg = 1; // Write 0
+    } else {
+        if (sample > 0) { rtt_arg = sample + 1; }
+        else { rtt_arg = 0; } // Keep
+    }
+    // Same logic as before
+    rtt_val = Array.update(reg_tcprtt, idx, update_flagged_32, rtt_arg, update_flagged_32, rtt_arg);
+
+    // sload_numerator = sbytes * spkts * 8
+    pkts_minus_one = spkts - 1;
+    base_calc = mult(sbytes, pkts_minus_one);
+    sload_numerator = base_calc << 3; 
+
+    generate check_node(0, ip_src, ingress_port, (int<8>)ip_ttl, 64, rtt_val, sbytes, sload_numerator, duration);
+}
+
+
+// ---- HANDLER: Forward ----
+handle do_forward(int<32> ingress_port) {
+    printf("BENIGN. Forwarding packet to port: %d", ingress_port);
+}
+
+handle do_detected_attack(int<32> src_ip, int<64> sbytes) {
+    printf("!! ATTACK !! Source: %d | Total Bytes: %d", src_ip, sbytes);
+}
+
+// ---- HANDLER: CHECK NODE ----
+handle check_node(
+    int<32> node_id,
+    int<32> ip_src,
+    int<32> ingress_port,
+    int<8> f_sttl,
+    int<8> f_dttl,
+    int<32> f_rtt,
+    int<64> f_sbytes,
+    int<64> f_sload_num,
+    int<64> f_duration
+) {
+    // 1. Fetch Tree Node Data
+    int<64> data = Array.get(tree_memory, node_id);
+    
+    // 2. Check Leaf Status (using explicit width for safety)
+    // shifting by 63 to get the MSB
+    int<64> is_leaf_flag = (data >> 63) & 1w64; 
+    
+    // Variables for extraction
+    int<32> class_val = 0;
+    int<32> f_id = 0;
+    int<64> th = 0w64;
+    int<32> th_32 = 0;
+    int<8> th_8 = 0;
+    int<32> next_node = 0;
+    int<32> true_node = 0;
+    int<32> false_node = 0;
+    bool condition = false;
+    
+    // Variables for the complex comparison (Feature 4)
+    int<64> million = 0w64;
+    int<64> lhs = 0w64;
+    int<64> rhs_temp = 0w64;
+    int<64> rhs = 0w64;
+
+    if (is_leaf_flag == 1w64) {
+        // ---- LEAF NODE LOGIC ----
+        // Extract class value (lower 24 bits of upper 32)
+        class_val = (int<32>)((data >> 32) & 0xFFFFFFw64);
+        
+        if (class_val == 1) {
+            generate do_detected_attack(ip_src, f_sbytes);
+        } else {
+            generate do_forward(ingress_port);
+        }
+    } else {
+        // ---- INTERNAL NODE LOGIC ----
+        // Extract fields: ID (7b), Threshold (24b), TrueNode (16b), FalseNode (16b)
+        f_id = (int<32>)((data >> 56) & 0x7Fw64);
+        th = (int<64>)((data >> 32) & 0xFFFFFFw64);
+        true_node = (int<32>)((data >> 16) & 0xFFFFw64);
+        false_node = (int<32>)(data & 0xFFFFw64);
+        
+        th_32 = (int<32>)th;
+        th_8 = (int<8>)th;
+        
+        // Default to False path
+        next_node = false_node; 
+        condition = false;
+
+        // Simple Comparisons
+        if ((f_id == 1) && (f_sttl <= th_8)) { condition = true; }      // src ttl
+        if ((f_id == 3) && (f_dttl <= th_8)) { condition = true; }      // dst ttl
+        if ((f_id == 10) && (f_rtt <= th_32)) { condition = true; }     // rtt
+        if ((f_id == 7) && (f_sbytes <= th)) { condition = true; }      // flow bytes
+        
+        // Complex Comparison (Byte Rate / Load)
+        // Formula: (sbytes / duration) <= threshold
+        // Rewritten to avoid division: sbytes <= threshold * duration
+        // Scaled: sbytes * 8 * 1,000,000 <= threshold * duration * sbytes
+        // Note: The logic below matches the debug file's math structure
+        if (f_id == 4) {
+            million = 1000000w64;
+            
+            // Calculate LHS
+            lhs = mult(f_sload_num, million);
+            
+            // Calculate RHS using helper (Replaces the manual loops)
+            rhs_temp = mult(th, f_duration);
+            rhs = mult(rhs_temp, f_sbytes);
+
+            if (lhs <= rhs) { condition = true; }
+        }
+
+        // Determine next hop
+        if (condition) { next_node = true_node; }
+
+        // Recurse to next node
+        generate check_node(next_node, ip_src, ingress_port, f_sttl, f_dttl, f_rtt, f_sbytes, f_sload_num, f_duration);
+    }
+}
+
+handle set_tree_node(
+    int<32> node_id, 
+    int<8> f_id, 
+    int<64> threshold, 
+    int<32> true_node, 
+    int<32> false_node, 
+    int<32> is_leaf, 
+    int<32> class_val
+) {
+    int<64> packed_data = 0w64;
+
+    if (is_leaf == 1) {
+        // [Leaf Flag (1b)] [Unused (7b)] [Class (24b)] [Unused (32b)]
+        // check_node looks for MSB (bit 63) and class_val at bit 32
+        packed_data = 1w64 << 63;
+        int<64> c_val_64 = (int<64>)class_val & 0xFFFFFFw64;
+        packed_data = packed_data | (c_val_64 << 32);
+    } else {
+        // [Flag 0 (1b)] [FID (7b)] [Thresh (24b)] [True (16b)] [False (16b)]
+        int<64> f_id_64 = ((int<64>)f_id & 0x7Fw64) << 56;
+        int<64> th_64   = ((int<64>)threshold & 0xFFFFFFw64) << 32;
+        int<64> true_64 = ((int<64>)true_node & 0xFFFFw64) << 16;
+        int<64> false_64 = (int<64>)false_node & 0xFFFFw64;
+        
+        packed_data = f_id_64 | th_64 | true_64 | false_64;
+    }
+
+    Array.set(tree_memory, node_id, packed_data);
+}
