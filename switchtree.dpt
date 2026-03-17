@@ -68,7 +68,6 @@ global Array.t<64> tree_memory = Array.create(TREE_SIZE);
 // Flow State
 global Array.t<32> reg_srcip   = Array.create(HASH_SIZE);
 global Array.t<64> reg_time_last  = Array.create(HASH_SIZE);
-
 global Array.t<32> reg_sbytes  = Array.create(HASH_SIZE);
 global Array.t<32> reg_spkts   = Array.create(HASH_SIZE);
 global Array.t<32> reg_dttl    = Array.create(HASH_SIZE); 
